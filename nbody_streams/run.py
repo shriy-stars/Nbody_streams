@@ -29,12 +29,20 @@ import time as pytime
 import h5py # For HDF5 snapshot output (if needed)
 
 try:
-    from .fields import compute_nbody_forces_gpu, compute_nbody_forces_cpu 
+    from .fields import (
+        compute_nbody_forces_gpu, compute_nbody_forces_cpu,
+        compute_nbody_potential_gpu, compute_nbody_potential_cpu,
+    )
     from .nbody_io import _save_snapshot, _save_restart, _load_restart, _update_snapshot_times
+    from .species import Species
 except ImportError as e:
     print(e)
-    from fields import compute_nbody_forces_gpu, compute_nbody_forces_cpu
+    from fields import (
+        compute_nbody_forces_gpu, compute_nbody_forces_cpu,
+        compute_nbody_potential_gpu, compute_nbody_potential_cpu,
+    )
     from nbody_io import _save_snapshot, _save_restart, _load_restart, _update_snapshot_times
+    from species import Species
 
 try:
     import cupy as cp
@@ -46,6 +54,8 @@ except ImportError:
 try:
     import agama
     AGAMA_AVAILABLE = True
+    # Default units set to Msol, kpc, km/s. Time is in kpc/(kms/s)
+    agama.setUnits(mass=1, length=1, velocity=1) 
 except ImportError:
     AGAMA_AVAILABLE = False
 
@@ -55,6 +65,12 @@ try:
 except ImportError:
     HAS_FALCON = False
     warnings.warn("pyfalcon not available. Tree code is disabled. Please use a limited number of particles.", ImportWarning)
+
+try:
+    from tqdm.auto import trange as _trange, tqdm as _tqdm_cls
+    _TQDM_OK = True
+except ImportError:
+    _TQDM_OK = False
 
 # ============================================================================
 # CONSTANTS AND TYPE DEFINITIONS
@@ -66,11 +82,18 @@ G_DEFAULT = 4.300917270069976e-06 # double precision value for accuracy, but we 
 KERNEL_TYPES = Literal['newtonian', 'plummer', 'dehnen_k1', 'dehnen_k2', 'spline']
  
 # Define this once at the top of your function or module
-_PRECISION_MAP = {
-    'float64': (cp.float64, np.float64),
-    'float32': (cp.float32, np.float32),
-    'float32_kahan': (cp.float32, np.float32)  # Same storage as float32!
-}
+if CUPY_AVAILABLE:
+    _PRECISION_MAP = {
+        'float64': (cp.float64, np.float64),
+        'float32': (cp.float32, np.float32),
+        'float32_kahan': (cp.float32, np.float32),  # Same storage as float32!
+    }
+else:
+    _PRECISION_MAP = {
+        'float64': (None, np.float64),
+        'float32': (None, np.float32),
+        'float32_kahan': (None, np.float32),
+    }
 NBODY_UNITS = {
     'kpc': 1.0, # length unit
     'Msun': 1.0, # mass unit
@@ -209,10 +232,10 @@ def _compute_accelerations_tree(
     G: float,
     external_potential: agama.Potential | None,
     time: float,
-) -> np.ndarray:
+) -> tuple[np.ndarray, np.ndarray]:
     """
     Compute accelerations using tree algorithm (pyfalcon).
-    
+
     Parameters
     ----------
     pos_cpu : np.ndarray
@@ -231,26 +254,29 @@ def _compute_accelerations_tree(
         External time-dependent potential.
     time : float
         Current simulation time.
-    
+
     Returns
     -------
-    np.ndarray
-        Total accelerations, shape (N, 3).
+    acc : np.ndarray, shape (N, 3)
+        Total accelerations.
+    phi : np.ndarray, shape (N,)
+        Gravitational potential per particle (self-gravity only).
+        Available for free from falcON -- useful for energy diagnostics.
     """
-    # Self-gravity from pyfalcon tree
-    acc, _ = pyfalcon.gravity(
-        pos_cpu, 
-        G * mass, 
-        eps=softening, 
+    # Self-gravity from pyfalcon tree — phi returned at no extra cost
+    acc, phi = pyfalcon.gravity(
+        pos_cpu,
+        G * mass,
+        eps=softening,
         theta=theta,
-        kernel=kernel
+        kernel=kernel,
     )
-    
+
     # Add external potential if provided
     if external_potential is not None:
         acc += external_potential.force(pos_cpu, t=time)
-    
-    return acc
+
+    return acc, phi
 
 def _compute_accelerations_cpu(
     pos_cpu: np.ndarray,
@@ -320,13 +346,17 @@ def run_nbody_gpu(
     kernel: Literal['newtonian', 'plummer', 'dehnen_k1', 'dehnen_k2', 'spline'] = 'spline',
     external_potential: 'agama.Potential | None' = None,
     external_update_interval: int = 1,
+    force_extra: 'Callable | None' = None,
     output_dir: str = "./output",
-    save_snapshots: bool = True,  # <--- NEW PARAMETER
+    save_snapshots: bool = True,
     snapshots: int = 10,
     num_files_to_write: int = 1,
     restart_interval: int = 1000,
     continue_run: bool = False,
+    overwrite: bool = False,
     verbose: bool = True,
+    debug_energy: bool = False,
+    species: list[Species] | None = None,
 ) -> np.ndarray:
     """
     Run GPU-accelerated N-body simulation with leapfrog (KDK) integration.
@@ -359,9 +389,32 @@ def run_nbody_gpu(
         'dehnen_k2', 'spline'. Default: 'spline'.
     external_potential : agama.Potential | None, optional
         External time-dependent potential. Default: None.
+
+        .. note:: **Dynamical friction is not included.**
+            The external potential is treated as a smooth, fixed background
+            field evaluated at each particle position.  There is no back-reaction
+            on the host and no granularity-driven scattering, so host-satellite
+            dynamical friction is implicitly zero.  This is a safe approximation
+            for satellite total masses M_sat < ~1e9 Msun at galactocentric
+            distances > 10 kpc (t_df >> t_Hubble).  For M_sat ~ 1e10 Msun
+            (LMC-class), consider adding a Chandrasekhar friction term via
+            ``force_extra`` (not yet implemented; tracked in the roadmap).
+
     external_update_interval : int, optional
         Update external forces every N steps (reduces Agama overhead).
         Default: 1 (update every step). Try 5-10 for slowly-varying potentials.
+    force_extra : callable or None, optional
+        Extra acceleration term added after gravity + external_potential at
+        every step.  Signature::
+
+            force_extra(pos, vel, masses, time) -> array_like, shape (N, 3)
+
+        On the GPU path ``pos`` and ``vel`` are **CuPy** arrays (float64,
+        device memory); the return value is converted to CuPy via
+        ``cp.asarray``, so returning a NumPy array is also accepted (triggers
+        a host→device copy).  The user is responsible for choosing the right
+        compute path; no automatic CPU/GPU transfer is performed.  Default:
+        None.
     output_dir : str, optional
         Output directory. Default: './output'.
     save_snapshots : bool, optional
@@ -464,8 +517,23 @@ def run_nbody_gpu(
     
     if external_potential is not None and not AGAMA_AVAILABLE:
         raise ImportError("Agama required for external_potential. Install Agama.")
-        
+
     output_path = Path(output_dir)
+
+    if save_snapshots and not continue_run:
+        existing = sorted(output_path.glob("snapshot*.h5"))
+        if existing:
+            if overwrite:
+                for f in existing:
+                    f.unlink()
+                if verbose:
+                    print(f"Removed {len(existing)} existing snapshot file(s) in '{output_dir}'.")
+            else:
+                raise FileExistsError(
+                    f"Output directory '{output_dir}' already contains snapshot files: "
+                    f"{[f.name for f in existing]}. "
+                    "Pass overwrite=True to delete them, or continue_run=True to resume."
+                )
 
     start_step = 0
     time = time_start
@@ -475,36 +543,59 @@ def run_nbody_gpu(
     if continue_run:
         restart_data = _load_restart(output_path)
         if restart_data is not None:
-            xv, time, start_step, saved_snap_counter = restart_data
-            snapshot_counter = int(saved_snap_counter) # Update snapshot counter from restart file
+            xv, time, start_step, saved_snap_counter = restart_data[:4]
+            snapshot_counter = int(saved_snap_counter)
             if verbose:
                 print(f"✓ Resuming from step {start_step}, time {time:.6e}")
     else:
-        xv = phase_space.copy()  # Ensure we have a local copy to modify
-    
-    
+        xv = phase_space.copy()
+
+    # Build per-snapshot and per-restart kwarg dicts once (avoids repeated if/else)
+    _snap_kwargs: dict = dict(
+        num_files_to_write=num_files_to_write,
+        total_expected_snapshots=snapshots,
+    )
+    _restart_kwargs: dict = {}
+    if species is not None:
+        _snap_kwargs["species"] = species
+        _snap_kwargs["time_step"] = dt
+        _soft_arr = (
+            np.full(N, float(softening), dtype=np.float64)
+            if np.isscalar(softening)
+            else np.asarray(softening, dtype=np.float64)
+        )
+        _restart_kwargs = dict(
+            mass_arr=masses.astype(np.float64),
+            softening_arr=_soft_arr,
+            species_names=[s.name for s in species],
+            species_N=[s.N for s in species],
+        )
+    else:
+        _snap_kwargs["mass_dark"] = float(masses[0])
+
     # Compute steps reliably (use round to avoid off-by-one)
     total_steps = int(round((time_end - time_start) / dt))
     remaining_steps = total_steps - start_step
-        
+
     # Compute snapshot steps (evenly spaced from 0 to total_steps)
     if snapshots > 1:
         snapshot_steps = np.round(np.linspace(0, total_steps, snapshots)).astype(int)
     else:
         snapshot_steps = np.array([total_steps], dtype=int)
 
-     # If not resuming from restart, initialize snapshot_counter from start_step
+    # If not resuming from restart, initialize snapshot_counter from start_step
     if snapshot_counter is None:
-        # For a fresh run, start at 0
-        # For a resumed run, count how many snapshots should have been written already
-        snapshot_counter = int(np.searchsorted(snapshot_steps, start_step, side="left"))  
+        snapshot_counter = int(np.searchsorted(snapshot_steps, start_step, side="left"))
 
     if verbose:
         print("="*80)
         print("GPU N-body Integration")
         print("="*80)
         print(f"Particles: {N:,}")
-        print(f"Time: {time_start:.3e} → {time_end:.3e} (dt={dt:.3e})")
+        if species is not None:
+            for s in species:
+                print(f"  [{s.name}] N={s.N:,}")
+        print(f"Time: {time_start:.3e} -> {time_end:.3e} (dt={dt:.3e})")
         print(f"Steps: {total_steps:,} ({remaining_steps:,} remaining)")
         print(f"Kernel: {kernel}, Softening: {softening if np.isscalar(softening) else 'variable'}")
         print(f"External potential: {'Yes' if external_potential is not None else 'No'}")
@@ -527,116 +618,153 @@ def run_nbody_gpu(
     if verbose:
         print("Computing initial forces (compiling CUDA kernel)...")
     
-    acc_gpu, cached_external_acc = _compute_accelerations_gpu(  
+    acc_gpu, cached_external_acc = _compute_accelerations_gpu(
         pos_gpu, mass_gpu, softening, G, precision, kernel,
-        external_potential, time, external_update_interval, start_step, None     
+        external_potential, time, external_update_interval, start_step, None
     )
-    
+
+    # Energy diagnostics setup
+    _mass_f64 = mass_gpu.astype(cp.float64)
+
+    def _energy_gpu(vel_: cp.ndarray, phi_: cp.ndarray) -> tuple[float, float]:
+        v2 = cp.sum(vel_ ** 2, axis=1)
+        KE = 0.5 * float(cp.sum(_mass_f64 * v2))
+        PE = 0.5 * float(cp.sum(_mass_f64 * phi_.astype(cp.float64)))
+        return KE, PE
+
+    E_ref = 0.0
+    _phi_gpu: cp.ndarray | None = None
+    if debug_energy:
+        _phi_gpu = compute_nbody_potential_gpu(
+            pos_gpu, mass_gpu, softening, G, precision, kernel, return_cupy=True
+        )
+        KE0, PE0 = _energy_gpu(vel_gpu, _phi_gpu)
+        E_ref = KE0 + PE0
+        if verbose:
+            print(f"  [Energy t=0] KE={KE0:.4e}  PE={PE0:.4e}  E={E_ref:.4e}")
+
     # Warmup complete, start timing
     if verbose:
         print("\nStarting integration...")
-    
-    # Save initial snapshot if requested (global index at snapshot_steps[snapshot_counter] == start_step)
+
+    # Save initial snapshot if requested
     if snapshot_counter < len(snapshot_steps) and snapshot_steps[snapshot_counter] == start_step:
-        # --- NEW IF CONDITION ---
-        if save_snapshots:  # Check if snapshot saving is enabled
+        if save_snapshots:
             xv_cpu = np.hstack([cp.asnumpy(pos_gpu), cp.asnumpy(vel_gpu)])
             _save_snapshot(xv_cpu, snapshot_counter, time, output_path,
-                        mass_dark=masses[0],  # dark mass in this code path
-                        num_files_to_write=num_files_to_write,
-                        total_expected_snapshots=snapshots)
+                           **_snap_kwargs)
             if verbose:
-                print(f"Saved snapshot snap: {snapshot_counter:03d} at step {start_step}, time {time:.6e}...")
+                print(f"Saved snapshot snap: {snapshot_counter:03d} at step "
+                      f"{start_step}, time {time:.6e}...")
             _update_snapshot_times(output_path, snapshot_counter, time)
-        # --- END NEW IF CONDITION ---
-        # ALWAYS increment counter, even if we didn't write to disk
         snapshot_counter += 1
-    
+
     # ============================================================================
     # Main integration loop: iterate over the remaining steps (1..remaining_steps)
     # ============================================================================
     t_start = pytime.perf_counter()
-    for step_i in range(1, remaining_steps + 1):
+    _report_every = max(1, remaining_steps // 20)
+
+    if _TQDM_OK and verbose:
+        _loop   = _trange(1, remaining_steps + 1, desc="N-body simulation", unit="step")
+        _vprint = _tqdm_cls.write
+    else:
+        _loop   = range(1, remaining_steps + 1)
+        def _vprint(msg: str) -> None:  # type: ignore[misc]
+            print(msg, flush=True)
+
+    for step_i in _loop:
         current_step = start_step + step_i
-        
+
         # === KDK Leapfrog (all on GPU) ===
-        
+
         # Kick (half-step)
         vel_gpu += acc_gpu * (dt_gpu / 2)
-        
+
         # Drift (full-step)
         pos_gpu += vel_gpu * dt_gpu
-        
+
         # Update time
         time += dt
-        
+
         # Compute new accelerations
         acc_gpu, cached_external_acc = _compute_accelerations_gpu(
             pos_gpu, mass_gpu, softening, G, precision, kernel,
             external_potential, time, external_update_interval,
             current_step, cached_external_acc
         )
-        
+
+        # Extra non-conservative forces (e.g. dynamical friction).
+        # pos_gpu and vel_gpu are CuPy arrays; return may be CuPy or NumPy.
+        if force_extra is not None:
+            acc_gpu = acc_gpu + cp.asarray(
+                force_extra(pos_gpu, vel_gpu, masses, time)
+            )
+
         # Kick (half-step)
         vel_gpu += acc_gpu * (dt_gpu / 2)
-        
+
         # === I/O Operations ===
-        # === snapshots (handle possibly multiple snapshot indices that fall here) ===
         while snapshot_counter < len(snapshot_steps) and current_step >= snapshot_steps[snapshot_counter]:
-            # --- NEW IF CONDITION ---
-            if save_snapshots:  # Check if snapshot saving is enabled
+            if save_snapshots:
                 xv_cpu = np.hstack([cp.asnumpy(pos_gpu), cp.asnumpy(vel_gpu)])
                 _save_snapshot(xv_cpu, snapshot_counter, time, output_path,
-                            num_files_to_write=num_files_to_write,
-                            mass_dark=masses[0],  # dark mass in this code path
-                            total_expected_snapshots=snapshots)
+                               **_snap_kwargs)
                 _update_snapshot_times(output_path, snapshot_counter, time)
                 if verbose:
-                    print(f"Saved snapshot id={snapshot_counter:03d} at step {current_step}, time {time:.6e}...")
-            # --- END NEW IF CONDITION ---
-
-            # ALWAYS increment counter, even if we didn't write to disk
+                    _vprint(f"Saved snapshot id={snapshot_counter:03d} at step "
+                            f"{current_step}, time {time:.6e}...")
             snapshot_counter += 1
 
-        # Progress update
-        if verbose and step_i % max(1, remaining_steps // 20) == 0:
+        # Progress update — suppress manual line when tqdm bar is active
+        _is_report_step = step_i % _report_every == 0
+        if verbose and (not _TQDM_OK or debug_energy) and _is_report_step:
             elapsed = pytime.perf_counter() - t_start
             rate = step_i / elapsed if elapsed > 0 else 0
             eta = (remaining_steps - step_i) / rate if rate > 0 else 0
             avg_step_time = elapsed / step_i if step_i > 0 else 0
-            print(f"  Step {current_step:>6}/{total_steps} | "
-                f"t={time:.4e} | "
-                f"Snapshots: {snapshot_counter}/{len(snapshot_steps)} | "
-                f"{rate:.1f} steps/s | "
-                f"avg {avg_step_time*1000:.1f}ms/step | "
-                f"ETA {eta:.0f}s")
-                
+            line = (f"  Step {current_step:>6}/{total_steps} | "
+                    f"t={time:.4e} | "
+                    f"Snapshots: {snapshot_counter}/{len(snapshot_steps)} | "
+                    f"{rate:.1f} steps/s | "
+                    f"avg {avg_step_time*1000:.1f}ms/step | "
+                    f"ETA {eta:.0f}s")
+            if debug_energy and E_ref != 0.0:
+                _phi_gpu = compute_nbody_potential_gpu(
+                    pos_gpu, mass_gpu, softening, G, precision, kernel, return_cupy=True
+                )
+                KE, PE = _energy_gpu(vel_gpu, _phi_gpu)
+                dE = (KE + PE - E_ref) / abs(E_ref)
+                Q  = KE / abs(PE) if PE != 0.0 else float("nan")
+                line += f" | Q={Q:.3f}  dE/E={dE:+.2e}"
+            if not _TQDM_OK or debug_energy:
+                _vprint(line)
+
         # Save restart file
         if current_step > 0 and (current_step % restart_interval) == 0:
             xv_cpu = np.hstack([cp.asnumpy(pos_gpu), cp.asnumpy(vel_gpu)])
-            _save_restart(xv_cpu, time, current_step, output_path, snapshot_counter)
+            _save_restart(xv_cpu, time, current_step, output_path, snapshot_counter,
+                          **_restart_kwargs)
     # =============================================================================
     # End of integration loop
     # =============================================================================
 
-    # ensure final snapshot saved (if last snapshot maps to total_steps and wasn't saved)
+    # Ensure final snapshot saved
     if snapshot_counter < len(snapshot_steps) and snapshot_steps[-1] == total_steps:
-        # --- NEW IF CONDITION ---
-        if save_snapshots:  # Check if snapshot saving is enabled
+        if save_snapshots:
             xv_cpu = np.hstack([cp.asnumpy(pos_gpu), cp.asnumpy(vel_gpu)])
             if verbose:
-                print(f"<=Saving final snapshot snap.{snapshot_counter:03d} at step {total_steps}, time {time:.6e}=>")
+                print(f"<=Saving final snapshot snap.{snapshot_counter:03d} at "
+                      f"step {total_steps}, time {time:.6e}=>")
             _save_snapshot(xv_cpu, snapshot_counter, time, output_path,
-                        mass_dark=masses[0],  # dark mass in this code path
-                        num_files_to_write=num_files_to_write,
-                        total_expected_snapshots=snapshots)
+                           **_snap_kwargs)
             _update_snapshot_times(output_path, snapshot_counter, time)
-        # --- END NEW IF CONDITION ---
-
         snapshot_counter += 1
-    
-    # when saving final restart (optional), include snapshot_counter
-    _save_restart(np.hstack([cp.asnumpy(pos_gpu), cp.asnumpy(vel_gpu)]), time, total_steps, output_path, snapshot_counter)
+
+    # Save final restart
+    xv_final_cpu = np.hstack([cp.asnumpy(pos_gpu), cp.asnumpy(vel_gpu)])
+    _save_restart(xv_final_cpu, time, total_steps, output_path, snapshot_counter,
+                  **_restart_kwargs)
 
     if verbose:
         t_end = pytime.perf_counter()
@@ -653,9 +781,8 @@ def run_nbody_gpu(
         print(f"Snapshots saved: {snapshot_counter}")
         print("="*80)
     
-    # Return final state
-    xv_final = np.hstack([cp.asnumpy(pos_gpu), cp.asnumpy(vel_gpu)])
-    return xv_final
+    # Return final state (reuse already-computed array from final restart save)
+    return xv_final_cpu
 
 def run_nbody_cpu(
     phase_space: np.ndarray,
@@ -670,13 +797,17 @@ def run_nbody_cpu(
     kernel: int | str = 1,
     nthreads: int | None = None,
     external_potential: agama.Potential | None = None,
+    force_extra: 'Callable | None' = None,
     output_dir: str = "./",
-    save_snapshots: bool = True,  # <--- NEW PARAMETER
+    save_snapshots: bool = True,
     snapshots: int = 1,
     num_files_to_write: int = 1,
     restart_interval: int = 1000,
     continue_run: bool = False,
+    overwrite: bool = False,
     verbose: bool = True,
+    debug_energy: bool = False,
+    species: list[Species] | None = None,
 ) -> np.ndarray:
     """
     Run CPU-NUMBA accelerated N-body simulation with leapfrog (KDK) integration.
@@ -712,6 +843,21 @@ def run_nbody_cpu(
         Number of threads for parallelization (only for method='direct', default: None = auto).
     external_potential : agama.Potential | None, optional
         External time-dependent potential (default: None).
+
+        .. note:: **Dynamical friction is not included.**
+            The host is modelled as a smooth background field; there is no
+            back-reaction or granularity-driven scattering.  Host-satellite
+            dynamical friction is therefore implicitly zero.  Safe for
+            M_sat < ~1e9 Msun at r > 10 kpc.  For LMC-class objects
+            (M_sat > 1e10 Msun), friction should be added explicitly.
+
+    force_extra : callable or None, optional
+        Extra acceleration term added after gravity + external_potential at
+        every step.  Signature::
+
+            force_extra(pos, vel, masses, time) -> array_like, shape (N, 3)
+
+        On the CPU path ``pos`` and ``vel`` are NumPy arrays.  Default: None.
     output_dir : str, optional
         Directory for output files (default: "./").
     save_snapshots : bool, optional
@@ -797,12 +943,52 @@ def run_nbody_cpu(
             "Install it or use method='direct' instead."
         )
     
-    # Set default kernel for direct method if not specified
-    if method == 'direct' and isinstance(kernel, int):
-        kernel = 'spline'
+    # Validate and normalise kernel for each method path
+    _DIRECT_KERNELS = {'newtonian', 'plummer', 'dehnen_k1', 'dehnen_k2', 'spline'}
+    _TREE_KERNEL_MAP = {'plummer': 0, 'dehnen_k1': 1, 'dehnen_k2': 2}
+
+    if method == 'direct':
+        if isinstance(kernel, int):
+            raise ValueError(
+                f"method='direct' requires a string kernel, got int {kernel!r}. "
+                f"Valid options: {sorted(_DIRECT_KERNELS)}"
+            )
+        if kernel not in _DIRECT_KERNELS:
+            raise ValueError(
+                f"Unknown kernel {kernel!r} for method='direct'. "
+                f"Valid options: {sorted(_DIRECT_KERNELS)}"
+            )
+    else:  # method == 'tree'
+        if isinstance(kernel, str):
+            if kernel not in _TREE_KERNEL_MAP:
+                raise ValueError(
+                    f"Unknown kernel {kernel!r} for method='tree'. "
+                    f"Valid string options: {sorted(_TREE_KERNEL_MAP)} "
+                    f"or pass an integer (0=plummer, 1=dehnen_k1, 2=dehnen_k2)."
+                )
+            kernel = _TREE_KERNEL_MAP[kernel]
+        elif kernel not in (0, 1, 2):
+            raise ValueError(
+                f"method='tree' kernel must be 0, 1, or 2, got {kernel!r}."
+            )
 
     N = phase_space.shape[0]
     output_path = Path(output_dir)
+
+    if save_snapshots and not continue_run:
+        existing = sorted(output_path.glob("snapshot*.h5"))
+        if existing:
+            if overwrite:
+                for f in existing:
+                    f.unlink()
+                if verbose:
+                    print(f"Removed {len(existing)} existing snapshot file(s) in '{output_dir}'.")
+            else:
+                raise FileExistsError(
+                    f"Output directory '{output_dir}' already contains snapshot files: "
+                    f"{[f.name for f in existing]}. "
+                    "Pass overwrite=True to delete them, or continue_run=True to resume."
+                )
 
     start_step = 0
     time = time_start
@@ -812,40 +998,62 @@ def run_nbody_cpu(
     if continue_run:
         restart_data = _load_restart(output_path)
         if restart_data is not None:
-            xv, time, start_step, saved_snap_counter = restart_data
-            snapshot_counter = int(saved_snap_counter) # Update snapshot counter from restart file
+            xv, time, start_step, saved_snap_counter = restart_data[:4]
+            snapshot_counter = int(saved_snap_counter)
             if verbose:
                 print(f"✓ Resuming from step {start_step}, time {time:.6e}")
     else:
-        xv = phase_space.copy()  # Ensure we have a local copy to modify
-    
+        xv = phase_space.copy()
+
+    # Build per-snapshot and per-restart kwarg dicts once
+    _snap_kwargs: dict = dict(
+        num_files_to_write=num_files_to_write,
+        total_expected_snapshots=snapshots,
+    )
+    _restart_kwargs: dict = {}
+    if species is not None:
+        _snap_kwargs["species"] = species
+        _snap_kwargs["time_step"] = dt
+        _soft_arr = (
+            np.full(N, float(softening), dtype=np.float64)
+            if np.isscalar(softening)
+            else np.asarray(softening, dtype=np.float64)
+        )
+        _restart_kwargs = dict(
+            mass_arr=np.asarray(masses, dtype=np.float64),
+            softening_arr=_soft_arr,
+            species_names=[s.name for s in species],
+            species_N=[s.N for s in species],
+        )
+    else:
+        _snap_kwargs["mass_dark"] = float(masses[0])
+
     # Compute steps reliably (use round to avoid off-by-one)
     total_steps = int(round((time_end - time_start) / dt))
     remaining_steps = total_steps - start_step
-        
+
     # Compute snapshot steps (evenly spaced from 0 to total_steps)
     if snapshots > 1:
         snapshot_steps = np.round(np.linspace(0, total_steps, snapshots)).astype(int)
     else:
         snapshot_steps = np.array([total_steps], dtype=int)
 
-     # If not resuming from restart, initialize snapshot_counter from start_step
+    # If not resuming from restart, initialize snapshot_counter from start_step
     if snapshot_counter is None:
-        # For a fresh run, start at 0
-        # For a resumed run, count how many snapshots should have been written already
-        snapshot_counter = int(np.searchsorted(snapshot_steps, start_step, side="left"))  
+        snapshot_counter = int(np.searchsorted(snapshot_steps, start_step, side="left"))
 
     if verbose:
         print("="*80)
         print("CPU N-body Integration")
         print("="*80)
         print(f"Particles: {N:,}")
-        print(f"Time: {time_start:.3e} → {time_end:.3e} (dt={dt:.3e})")
+        if species is not None:
+            for s in species:
+                print(f"  [{s.name}] N={s.N:,}")
+        print(f"Time: {time_start:.3e} -> {time_end:.3e} (dt={dt:.3e})")
         print(f"Steps: {total_steps:,} ({remaining_steps:,} remaining)")
         print(f"Kernel: {kernel}, Softening: {softening if np.isscalar(softening) else 'variable'}")
         print(f"External potential: {'Yes' if external_potential is not None else 'No'}")
-        if external_potential is not None:
-            print(f"  Update interval: every {external_update_interval} steps")
         print(f"Snapshots: {snapshots} (every ~{total_steps//snapshots:,} steps)")
         print(f"Restart files: every {restart_interval} steps")
         print("="*80)
@@ -853,110 +1061,154 @@ def run_nbody_cpu(
     # Initial acceleration (with warmup)
     if verbose:
         print("Computing initial forces (compiling NUMBA kernel)...")
-    
-    # Select acceleration computation method
+
     if method == 'tree':
         if verbose: print(f"Using tree method (theta={theta}, kernel={kernel})")
-        compute_acc = lambda pos, t: _compute_accelerations_tree(
-            pos, masses, softening, theta, kernel, G, external_potential, t
+        acc_cpu, phi_cpu = _compute_accelerations_tree(
+            xv[:, :3], masses, softening, theta, kernel, G, external_potential, time
         )
     else:  # method == 'direct'
         if verbose: print(f"Using direct method (kernel={kernel}, nthreads={nthreads})")
-        compute_acc = lambda pos, t: _compute_accelerations_cpu(
-            pos, masses, softening, G, kernel, nthreads, external_potential, t
+        acc_cpu = _compute_accelerations_cpu(
+            xv[:, :3], masses, softening, G, kernel, nthreads, external_potential, time
         )
-    
-    # Initial acceleration
-    acc_cpu = compute_acc(xv[:, :3], time)
-    
+        phi_cpu = (compute_nbody_potential_cpu(xv[:, :3], masses, softening, G, kernel, nthreads)
+                   if debug_energy else None)
+
+    # Energy diagnostics setup
+    def _energy_cpu(vel_: np.ndarray, phi_: np.ndarray) -> tuple[float, float]:
+        v2 = np.sum(vel_ ** 2, axis=1)
+        KE = 0.5 * np.dot(masses, v2)
+        PE = 0.5 * np.dot(masses, phi_)
+        return KE, PE
+
+    E_ref = 0.0
+    if debug_energy and phi_cpu is not None:
+        KE0, PE0 = _energy_cpu(xv[:, 3:6], phi_cpu)
+        E_ref = KE0 + PE0
+        if verbose:
+            print(f"  [Energy t=0] KE={KE0:.4e}  PE={PE0:.4e}  E={E_ref:.4e}")
+
     # Warmup complete, start timing
     if verbose:
         print("\nStarting integration...")
-    
-    # Save initial snapshot if requested (global index at snapshot_steps[snapshot_counter] == start_step)
+
+    # Save initial snapshot if requested
     if snapshot_counter < len(snapshot_steps) and snapshot_steps[snapshot_counter] == start_step:
-        if save_snapshots:  # Check if snapshot saving is enabled
-            _save_snapshot(xv, snapshot_counter, time, output_path,
-                        mass_dark=masses[0],  # no dark mass in this code path
-                        num_files_to_write=num_files_to_write,
-                        total_expected_snapshots=snapshots)
+        if save_snapshots:
+            _save_snapshot(xv, snapshot_counter, time, output_path, **_snap_kwargs)
             _update_snapshot_times(output_path, snapshot_counter, time)
             if verbose:
-                print(f"Saved snapshot snap: {snapshot_counter:03d} at step {start_step}, time {time:.6e}...")
+                print(f"Saved snapshot snap: {snapshot_counter:03d} at step "
+                      f"{start_step}, time {time:.6e}...")
         snapshot_counter += 1
-    
+
     # ============================================================================
     # Main integration loop: iterate over the remaining steps (1..remaining_steps)
     # ============================================================================
     t_start = pytime.perf_counter()
-    for step_i in range(1, remaining_steps + 1):
+    _report_every = max(1, remaining_steps // 50)
+
+    if _TQDM_OK and verbose:
+        _loop   = _trange(1, remaining_steps + 1, desc="N-body simulation", unit="step")
+        _vprint = _tqdm_cls.write
+    else:
+        _loop   = range(1, remaining_steps + 1)
+        def _vprint(msg: str) -> None:  # type: ignore[misc]
+            print(msg, flush=True)
+
+    for step_i in _loop:
         current_step = start_step + step_i
 
         # Kick-Drift-Kick leapfrog
-        
-        # Kick (half-step)
-        xv[:, 3:6] += acc_cpu * (dt / 2)  
-        
-        # Drift (full-step)
-        xv[:, 0:3] += xv[:, 3:6] * dt  
-        
-        # Update time before force computation
-        time += dt  
 
-        # Recompute accelerations at new positions and time
-        acc_cpu = compute_acc(xv[:, :3], time)
-        
         # Kick (half-step)
-        xv[:, 3:6] += acc_cpu * (dt / 2)  
-        
+        xv[:, 3:6] += acc_cpu * (dt / 2)
+
+        # Drift (full-step)
+        xv[:, 0:3] += xv[:, 3:6] * dt
+
+        # Update time before force computation
+        time += dt
+
+        # Recompute accelerations (and phi for tree — free; for direct only at report steps)
+        if method == 'tree':
+            acc_cpu, phi_cpu = _compute_accelerations_tree(
+                xv[:, :3], masses, softening, theta, kernel, G, external_potential, time
+            )
+        else:
+            acc_cpu = _compute_accelerations_cpu(
+                xv[:, :3], masses, softening, G, kernel, nthreads, external_potential, time
+            )
+            if debug_energy and step_i % _report_every == 0:
+                phi_cpu = compute_nbody_potential_cpu(
+                    xv[:, :3], masses, softening, G, kernel, nthreads
+                )
+
+        # Extra non-conservative forces (e.g. dynamical friction).
+        # pos and vel are NumPy arrays on the CPU path.
+        # phi_cpu is available for free on the tree path; None on direct path.
+        if force_extra is not None:
+            acc_cpu = acc_cpu + np.asarray(
+                force_extra(xv[:, :3], xv[:, 3:6], masses, time, phi=phi_cpu)
+            )
+
+        # Kick (half-step)
+        xv[:, 3:6] += acc_cpu * (dt / 2)
+
         # === I/O Operations ===
-        # === snapshots (handle possibly multiple snapshot indices that fall here) ===
         while snapshot_counter < len(snapshot_steps) and current_step >= snapshot_steps[snapshot_counter]:
-            if save_snapshots:  # Check if snapshot saving is enabled
-                _save_snapshot(xv, snapshot_counter, time, output_path,
-                            mass_dark=masses[0],  # no dark mass in this code path
-                            num_files_to_write=num_files_to_write,
-                            total_expected_snapshots=snapshots)
+            if save_snapshots:
+                _save_snapshot(xv, snapshot_counter, time, output_path, **_snap_kwargs)
                 _update_snapshot_times(output_path, snapshot_counter, time)
                 if verbose:
-                    print(f"Saved snapshot id={snapshot_counter:03d} at step {current_step}, time {time:.6e}...")            
+                    _vprint(f"Saved snapshot id={snapshot_counter:03d} at step "
+                            f"{current_step}, time {time:.6e}...")
             snapshot_counter += 1
 
-        # Progress update
-        if verbose and step_i % max(1, remaining_steps // 50) == 0:
+        # Progress update — suppress manual line when tqdm bar is active
+        _is_report_step = step_i % _report_every == 0
+        if verbose and (not _TQDM_OK or debug_energy) and _is_report_step:
             elapsed = pytime.perf_counter() - t_start
             rate = step_i / elapsed if elapsed > 0 else 0
             eta = (remaining_steps - step_i) / rate if rate > 0 else 0
             avg_step_time = elapsed / step_i if step_i > 0 else 0
-            print(f"  Step {current_step:>6}/{total_steps} | "
-                f"t={time:.4e} | "
-                f"Snapshots: {snapshot_counter}/{len(snapshot_steps)} | "
-                f"{rate:.1f} steps/s | "
-                f"avg {avg_step_time*1000:.1f}ms/step | "
-                f"ETA {eta:.0f}s")
-                
+            line = (f"  Step {current_step:>6}/{total_steps} | "
+                    f"t={time:.4e} | "
+                    f"Snapshots: {snapshot_counter}/{len(snapshot_steps)} | "
+                    f"{rate:.1f} steps/s | "
+                    f"avg {avg_step_time*1000:.1f}ms/step | "
+                    f"ETA {eta:.0f}s")
+            if debug_energy and phi_cpu is not None and E_ref != 0.0:
+                KE, PE = _energy_cpu(xv[:, 3:6], phi_cpu)
+                dE = (KE + PE - E_ref) / abs(E_ref)
+                Q  = KE / abs(PE) if PE != 0.0 else float("nan")
+                line += f" | Q={Q:.3f}  dE/E={dE:+.2e}"
+            if not _TQDM_OK or debug_energy:
+                _vprint(line)
+
         # Save restart file
         if current_step > 0 and (current_step % restart_interval) == 0:
-            _save_restart(xv, time, current_step, output_path, snapshot_counter)
+            _save_restart(xv, time, current_step, output_path, snapshot_counter,
+                          **_restart_kwargs)
 
     # =============================================================================
     # End of integration loop
     # =============================================================================
     
-     # ensure final snapshot saved (if last snapshot maps to total_steps and wasn't saved)
+    # Ensure final snapshot saved
     if snapshot_counter < len(snapshot_steps) and snapshot_steps[-1] == total_steps:
-        if save_snapshots:  # Check if snapshot saving is enabled
+        if save_snapshots:
             if verbose:
-                print(f"<=Saving final snapshot snap.{snapshot_counter:03d} at step {total_steps}, time {time:.6e}=>")
-            _save_snapshot(xv, snapshot_counter, time, output_path,
-                        mass_dark=masses[0],  # no dark mass in this code path
-                        num_files_to_write=num_files_to_write,
-                        total_expected_snapshots=snapshots)
+                print(f"<=Saving final snapshot snap.{snapshot_counter:03d} at "
+                      f"step {total_steps}, time {time:.6e}=>")
+            _save_snapshot(xv, snapshot_counter, time, output_path, **_snap_kwargs)
             _update_snapshot_times(output_path, snapshot_counter, time)
         snapshot_counter += 1
-    
-    # when saving final restart (optional), include snapshot_counter
-    _save_restart(xv, time, total_steps, output_path, snapshot_counter)
+
+    # Save final restart
+    _save_restart(xv, time, total_steps, output_path, snapshot_counter,
+                  **_restart_kwargs)
 
     if verbose:
         t_end = pytime.perf_counter()
@@ -982,13 +1234,20 @@ def run_nbody_cpu(
 
 def make_plummer_sphere(
     N: int,
-    M_total: float = 1.0,
-    a: float = 1.0,
-    seed: int = 42,
+    M_total: float = 10_000, # Msun
+    a: float = 0.01, # kpc
+    seed: int = 42069,
+    G: float = G_DEFAULT, # default code units. 
 ) -> tuple[np.ndarray, np.ndarray]:
     """
-    Generate Plummer sphere in virial equilibrium.
-    
+    Generate a Plummer sphere in virial equilibrium.
+
+    Positions are sampled from the Plummer density profile:
+        rho(r) = (3 M / 4 pi a^3) * (1 + r^2/a^2)^(-5/2)
+
+    Velocities are sampled from the Plummer distribution function via
+    rejection sampling following Aarseth, Henon & Wielen (1974).
+
     Parameters
     ----------
     N : int
@@ -999,54 +1258,80 @@ def make_plummer_sphere(
         Plummer scale radius.
     seed : int
         Random seed.
-    
+    G : float
+        Gravitational constant. Defaults to G_DEFAULT.
+
     Returns
     -------
     phase_space : np.ndarray, shape (N, 6)
-        Positions and velocities.
+        Positions (x, y, z) and velocities (vx, vy, vz).
     masses : np.ndarray, shape (N,)
         Particle masses (equal mass).
     """
     rng = np.random.default_rng(seed)
-    
-    # Sample radii from Plummer profile
-    u = rng.random(N)
-    r = a / np.sqrt(u**(-2/3) - 1)
-    
-    # Isotropic angles
-    theta = np.arccos(2 * rng.random(N) - 1)
-    phi = 2 * np.pi * rng.random(N)
-    
-    # Positions
-    x = r * np.sin(theta) * np.cos(phi)
-    y = r * np.sin(theta) * np.sin(phi)
-    z = r * np.cos(theta)
-    
-    # Velocities from distribution function (simplified)
-    G = 1.0  # N-body units
-    v_esc = np.sqrt(2 * G * M_total / np.sqrt(r**2 + a**2))
-    
-    v_mag = np.zeros(N)
+
+    # ------------------------------------------------------------------
+    # 1. Sample radii via inverse CDF of the Plummer mass profile
+    #    M(<r) = M_total * r^3 / (r^2 + a^2)^(3/2)
+    #    Inverted: r = a / sqrt(u^(-2/3) - 1),  u ~ Uniform(0, 1)
+    # ------------------------------------------------------------------
+    u = rng.uniform(0.0, 1.0, N)
+    r = a / np.sqrt(u ** (-2.0 / 3.0) - 1.0)
+
+    # Isotropic position angles
+    cos_theta = rng.uniform(-1.0, 1.0, N)
+    sin_theta = np.sqrt(1.0 - cos_theta ** 2)
+    phi = rng.uniform(0.0, 2.0 * np.pi, N)
+
+    x = r * sin_theta * np.cos(phi)
+    y = r * sin_theta * np.sin(phi)
+    z = r * cos_theta
+
+    # ------------------------------------------------------------------
+    # 2. Sample speeds via rejection sampling (Aarseth, Henon & Wielen 1974)
+    #
+    #    The Plummer DF in terms of q = v / v_esc is:
+    #        f(q) dq  ∝  q^2 (1 - q^2)^(7/2)   for q in [0, 1)
+    #
+    #    Maximum of h(q) = q^2 (1 - q^2)^3.5:
+    #        dh/dq = 0  =>  q_peak = sqrt(2/9)  => h_max ≈ 0.092
+    #
+    #    We draw (q, g) with q ~ Uniform(0,1), g ~ Uniform(0, h_max)
+    #    and accept when g <= h(q).
+    # ------------------------------------------------------------------
+    v_esc = np.sqrt(2.0 * G * M_total / np.sqrt(r ** 2 + a ** 2))
+
+    h_max = 0.09375  # exact: (2/9)*(7/9)^3.5 — safe upper envelope
+
+    v_mag = np.empty(N)
     for i in range(N):
-        q = 0.0
         while True:
-            q = rng.random()
-            g = rng.random()
-            if g < q**2 * (1 - q**2)**3.5:
+            q = rng.uniform(0.0, 1.0)
+            g = rng.uniform(0.0, h_max)
+            if g <= q ** 2 * (1.0 - q ** 2) ** 3.5:
                 break
         v_mag[i] = q * v_esc[i]
-    
+
     # Isotropic velocity directions
-    theta_v = np.arccos(2 * rng.random(N) - 1)
-    phi_v = 2 * np.pi * rng.random(N)
-    
-    vx = v_mag * np.sin(theta_v) * np.cos(phi_v)
-    vy = v_mag * np.sin(theta_v) * np.sin(phi_v)
-    vz = v_mag * np.cos(theta_v)
-    
+    cos_theta_v = rng.uniform(-1.0, 1.0, N)
+    sin_theta_v = np.sqrt(1.0 - cos_theta_v ** 2)
+    phi_v = rng.uniform(0.0, 2.0 * np.pi, N)
+
+    vx = v_mag * sin_theta_v * np.cos(phi_v)
+    vy = v_mag * sin_theta_v * np.sin(phi_v)
+    vz = v_mag * cos_theta_v
+
+    # ------------------------------------------------------------------
+    # 3. Centre-of-mass correction
+    #    Shift positions and velocities so the system has zero net
+    #    momentum and is centred on the origin.
+    # ------------------------------------------------------------------
+    x -= x.mean();  y -= y.mean();  z -= z.mean()
+    vx -= vx.mean(); vy -= vy.mean(); vz -= vz.mean()
+
     phase_space = np.column_stack([x, y, z, vx, vy, vz])
-    masses = np.full(N, M_total / N, dtype=np.float32)
-    
+    masses = np.full(N, M_total / N, dtype=np.float64)
+
     return phase_space, masses
 
 

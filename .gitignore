@@ -28,6 +28,7 @@ venv/
 *.times
 test_orbit/
 test_plummer/
+output/
 dist/
 build/
 *.egg-info/
@@ -38,3 +39,12 @@ __pycache__/
 
 # Claude plans
 .claude/
+
+# AGAMA helpers – local test data only, never commit
+nbody_streams/AGAMA_helpers/example_potentials/
+nbody_streams/agama_helper/example_potentials/
+
+# Compiled C/CUDA build artifacts
+*.o
+*.so
+*.a

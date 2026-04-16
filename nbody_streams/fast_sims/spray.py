@@ -33,9 +33,7 @@ __all__ = [
 ]
 
 
-# ╔══════════════════════════════════════════════════════════════════════════╗
-# ║  Jacobi radius / rotation matrices                                     ║
-# ╚══════════════════════════════════════════════════════════════════════════╝
+# --- Jacobi radius / rotation matrices ---
 
 def _get_jacobi_rad_vel_mtx(
     pot_host,
@@ -127,9 +125,7 @@ def _get_jacobi_rad_vel_mtx(
     return r_jacobi, v_jacobi, R
 
 
-# ╔══════════════════════════════════════════════════════════════════════════╗
-# ║  IC generators                                                         ║
-# ╚══════════════════════════════════════════════════════════════════════════╝
+# --- IC generators ---
 
 def create_ic_particle_spray_chen2025(
     orbit_sat: np.ndarray,
@@ -300,9 +296,7 @@ def create_ic_particle_spray_fardal2015(
     return ic_stream
 
 
-# ╔══════════════════════════════════════════════════════════════════════════╗
-# ║  Main driver                                                           ║
-# ╚══════════════════════════════════════════════════════════════════════════╝
+# --- Main driver ---
 
 def create_particle_spray_stream(
     pot_host,
@@ -315,8 +309,6 @@ def create_particle_spray_stream(
     time_end: float = 13.78,
     time_stripping: np.ndarray | None = None,
     save_rate: int = 1,
-    dynFric: bool = False,
-    pot_for_dynFric_sigma=None,
     gala_modified: bool = True,
     add_perturber: dict[str, Any] | None = None,
     create_ic_method: Callable = create_ic_particle_spray_chen2025,
@@ -347,9 +339,9 @@ def create_particle_spray_stream(
     prog_pot_kind : ``'King'``, ``'Plummer'``, or ``'Plummer_withRcut'``
         Progenitor potential profile.
     time_total : float
-        Look-back time to rewind the orbit (Gyr, >= 0).
+        Look-back time to rewind the orbit (kpc/(km/s)~Gyr, >= 0).
     time_end : float
-        Present-day epoch (Gyr).
+        Present-day epoch (kpc/(km/s)~Gyr).
     time_stripping : np.ndarray, shape ``(N,)``, optional
         Custom particle-release times, where ``N = num_particles // 2 + 1``.
         Values must lie in ``[time_end - time_total, time_end]``.
@@ -357,16 +349,34 @@ def create_particle_spray_stream(
         corresponding to **uniform stripping** along the orbit.
     save_rate : int
         Number of output snapshots (1 = final only).
-    dynFric : bool
-        Enable dynamical friction on the progenitor orbit.
-    pot_for_dynFric_sigma : agama.Potential, optional
-        Potential for velocity-dispersion computation (DF friction).
     gala_modified : bool
         Use Gala-modified dispersion parameters (Fardal method).
     add_perturber : dict, optional
-        Perturber properties.  Must contain ``'mass'`` (M_sun),
-        ``'scaleRadius'`` (kpc), ``'w_subhalo_impact'`` (shape ``(6,)``),
-        and ``'time_impact'`` (Gyr).  Set to *None* to disable.
+        Subhalo perturber properties.  Required keys:
+
+        - ``'mass'`` : float — subhalo mass (M_sun).
+        - ``'scaleRadius'`` : float — NFW scale radius (kpc).
+        - ``'w_subhalo_impact'`` : array_like, shape ``(6,)`` — subhalo
+          phase-space ``[x, y, z, vx, vy, vz]`` at impact.
+        - ``'time_impact'`` : float — epoch of closest approach
+          (kpc/(km/s) ~Gyr, same time axis as *time_end*).
+
+        Optional keys:
+
+        - ``'time_window'`` : float — full duration of the mass-on window
+          (kpc/(km/s) ~Gyr), centred on ``time_impact``.  The subhalo mass
+          is active in ``[time_impact - time_window/2, time_impact + time_window/2]``,
+          clipped to the simulation bounds.  If the turn-off edge reaches or
+          exceeds ``time_end`` the mass stays on for the rest of the
+          simulation (no turn-off transition).  If absent (default) the mass
+          is on for the **entire** integration.
+        - ``'trunc_nfw'`` : bool — use a truncated NFW profile (default
+          *True*).
+
+        When this dict is provided the progenitor orbit is rewound in the
+        **combined** host + perturber potential so the perturber's gravity
+        is self-consistently included during orbit rewinding and stripping.
+        Set to *None* to disable.
     create_ic_method : Callable
         IC generator function (must accept a compatible signature).
     verbose : bool
@@ -439,9 +449,24 @@ def create_particle_spray_stream(
 
     N = num_particles // 2 + 1
 
-    # --- Rewind progenitor orbit ---
+    # --- Perturber (optional) ---
+    # Build the perturber potential first so it can be included when rewinding
+    # the progenitor orbit — the subhalo's gravity is self-consistently present
+    # during orbit rewinding and particle stripping.
+    if add_perturber['mass'] > 0:
+        pot_perturber_moving = _create_perturber_potential(
+            add_perturber, pot_host, time_total, time_end,
+            t_window=add_perturber.get('time_window', None),
+            trunc_nfw=add_perturber.get('trunc_nfw', True),
+            verbose=verbose,
+        )
+        pot_host_eff = agama.Potential(pot_host, pot_perturber_moving)
+    else:
+        pot_host_eff = pot_host
+
+    # --- Rewind progenitor orbit (in host + perturber if present) ---
     time_sat, orbit_sat = agama.orbit(
-        ic=sat_cen_present, potential=pot_host,
+        ic=sat_cen_present, potential=pot_host_eff,
         time=-time_total, timestart=time_end, trajsize=N,
     )
 
@@ -458,6 +483,7 @@ def create_particle_spray_stream(
         potential=pot_sat,
         center=np.column_stack([time_sat, orbit_sat]),
     )
+    pot_total = agama.Potential(pot_host_eff, pot_sat_moving)
 
     # --- Stripping times ---
     if time_stripping is None:
@@ -482,7 +508,7 @@ def create_particle_spray_stream(
             # Create a tiny "ramp" 
             # For N=5001, a step of 1e-11 results in a total shift of 5e-8.
             # This is physically negligible but mathematically sufficient for splines.   
-            # Enforce strict monotonicity — episodic sampling can produce
+            # Enforce strict monotonicity - episodic sampling can produce
             # duplicate times which would create multi-valued functions.
             dt_eps = 1e-10
             ramp = np.arange(len(time_stripping)) * dt_eps
@@ -511,18 +537,10 @@ def create_particle_spray_stream(
         )
         orbit_strip = orbit_interp(time_stripping)
 
-    # --- Perturber (optional) ---
-    if add_perturber['mass'] > 0:
-        pot_perturber_moving = _create_perturber_potential(
-            add_perturber, pot_host, time_total, time_end, verbose=verbose,
-        )
-        pot_total = agama.Potential(pot_host, pot_sat_moving, pot_perturber_moving)
-    else:
-        pot_total = agama.Potential(pot_host, pot_sat_moving)
 
     # --- Generate initial conditions ---
     rj, vj, R = _get_jacobi_rad_vel_mtx(
-        pot_host, orbit_strip, initmass,
+        pot_host_eff, orbit_strip, initmass,
         t=time_stripping, eigenvalue_method=eigenvalue_method,
     )
 
@@ -540,16 +558,11 @@ def create_particle_spray_stream(
     ic_stream = create_ic_method(**filtered_args)
     time_seed = np.repeat(time_stripping, 2)
 
-    # --- Save times ---
+    # --- Progenitor interpolation for multi-snapshot ---
     if save_rate > 1:
         save_times = np.linspace(
             time_end - time_total, time_end - 1e-6, save_rate,
-        )
-    else:
-        save_times = time_end - 1e-5 # clip for floating points
-
-    # --- Progenitor interpolation for multi-snapshot ---
-    if save_rate > 1:
+        )       
         if verbose:
             print("Interpolating particle trajectories in time.")
         prog_interp = interp1d(
@@ -558,21 +571,35 @@ def create_particle_spray_stream(
         )
         prog_xv = prog_interp(save_times)
 
-    # --- Integrate all stream particles ---
-    result = agama.orbit(
-        potential=pot_total,
-        ic=ic_stream[:-2],
-        timestart=time_seed[:-2],
-        time=time_end - time_seed[:-2],
-        dtype=object, # Agama's inbuild trajectory interpolator. 
-        accuracy=accuracy_integ,
-        verbose=verbose,
-    )
+        # --- Integrate all stream particles ---
+        result = agama.orbit(
+            potential=pot_total,
+            ic=ic_stream[:-2],
+            timestart=time_seed[:-2],
+            time=time_end - time_seed[:-2],
+            dtype=object, # Agama's inbuild trajectory interpolator. 
+            accuracy=accuracy_integ,
+            verbose=verbose,
+        )
 
-    # ======== Particle Trajectory from the interpolator ========
-    part_xv = np.stack(
-        [orbit(save_times) for orbit in result], axis=0,
-    )
+        # ======== Particle Trajectory from the interpolator ========
+        part_xv = np.stack(
+            [orbit(save_times) for orbit in result], axis=0,
+        )
+
+    else:
+        # Single snapshot: just integrate to final time without interpolation.
+        part_xv = np.concatenate(
+            agama.orbit(
+                potential=pot_total,
+                ic=ic_stream[:-2],
+                timestart=time_seed[:-2],
+                time=time_end - time_seed[:-2],
+                trajsize=1, # Only final state
+                accuracy=accuracy_integ,
+                verbose=verbose,
+                )[:, 1].tolist(), axis=0
+            )
 
     return {
         'times': np.around(save_times, decimals=5) if save_rate > 1 else time_sat,

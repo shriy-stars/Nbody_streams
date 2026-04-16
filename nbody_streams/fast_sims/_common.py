@@ -1,6 +1,6 @@
 """Private helpers shared by fast_sims methods.
 
-Functions here are implementation details — not part of the public API.
+Functions here are implementation details - not part of the public API.
 """
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ try:
 except ImportError:
     AGAMA_AVAILABLE = False
 
-__all__: list[str] = []  # nothing public — internal helpers only
+__all__: list[str] = []  # nothing public - internal helpers only
 
 
 # ---------------------------------------------------------------------------
@@ -39,12 +39,12 @@ def _compute_vel_disp_from_Potential(
         Ideally an axisymmetric / spherically symmetric model.
     grid_r : np.ndarray, optional
         Radial grid for the dispersion spline.  Defaults to
-        ``np.logspace(-1, 2, 16)`` (0.1 – 100 kpc).
+        ``np.logspace(-1, 2, 16)`` (0.1 - 100 kpc).
 
     Returns
     -------
     Callable
-        ``sigma(r)`` — velocity dispersion at radius *r* (km/s).
+        ``sigma(r)`` - velocity dispersion at radius *r* (km/s).
     """
     if grid_r is None:
         grid_r = np.logspace(-1, 2, 16)
@@ -62,18 +62,12 @@ def _compute_vel_disp_from_Potential(
 
     except Exception:
         warnings.warn(
-            "Could not compute velocity dispersion from potential; "
-            "falling back to precomputed MW profile.",
+            "Could not compute velocity dispersion from quasispherical DF; "
+            "falling back to Jeans equation.",
             RuntimeWarning,
         )
-        grid_sig_init = np.array([
-            158.34386609, 200.12076947, 208.35638186, 207.53478107,
-            197.97276146, 195.18822847, 188.6893688,  183.74527079,
-            187.35960162, 193.26190609, 173.27866017, 143.68049751,
-            132.84412575, 121.76024275, 106.50314755, 104.28241804,
-        ])
-        logspl_init = agama.Spline(np.log(grid_r), np.log(grid_sig_init))
-        return lambda r: np.exp(logspl_init(np.log(r)))
+        from nbody_streams._chandrasekhar import _jeans_sigma_r
+        return _jeans_sigma_r(pot_for_dynFric_sigma, t_eval=0.0, grid_r=grid_r)
 
 
 # ---------------------------------------------------------------------------
@@ -343,12 +337,21 @@ def _create_perturber_potential(
     pot_host,
     time_total: float,
     time_end: float,
+    t_window: float | None = None,
+    trunc_nfw: bool = True,
     verbose: bool = False,
 ) -> Any:
     """Build a moving NFW perturber potential on a self-consistent orbit.
 
-    The perturber is rewound from its impact phase-space to the simulation
-    start, then integrated forward to present day.
+    The perturber is always rewound from its impact phase-space to the
+    simulation start, then integrated forward to present day — so the full
+    trajectory is available regardless of *t_window*.
+
+    By default the subhalo mass is on for the **entire** integration.  If
+    *t_window* is supplied, the mass is instead active only within a window of
+    full width *t_window* centred on ``time_impact``, i.e. the mass is on
+    from ``time_impact - t_window/2`` to ``time_impact + t_window/2`` and zero
+    outside that interval.
 
     Parameters
     ----------
@@ -358,7 +361,19 @@ def _create_perturber_potential(
     pot_host : agama.Potential
         Host potential for the perturber orbit.
     time_total, time_end : float
-        Simulation time span and end epoch (Gyr).
+        Simulation time span and end epoch (kpc/(km/s) ~Gyr).
+    t_window : float, optional
+        Full duration of the mass-on window (same units as *time_impact*).
+        The mass turns on at ``time_impact - t_window/2`` and off at
+        ``time_impact + t_window/2``.  Both edges are clipped to the
+        simulation bounds ``[time_end - time_total, time_end]``:
+        if the turn-on edge falls before the simulation start the mass is
+        on from the very beginning; if the turn-off edge falls at or beyond
+        ``time_end`` the mass stays on for the remainder of the simulation
+        (no turn-off transition is added).  If *None* (default) the mass is
+        on for the entire integration.
+    trunc_nfw : bool
+        Whether to use Agama style truncated at 10 rs NFW profile.
     verbose : bool
         Print status messages.
 
@@ -384,33 +399,92 @@ def _create_perturber_potential(
     if not isinstance(time_impact, (int, float)) or not np.isfinite(time_impact):
         raise TypeError("time_impact must be a finite scalar (Gyr).")
 
-    if verbose:
-        print(
-            f"Adding perturber on self-consistent orbit "
-            f"(mass={add_perturber['mass']:.2e} M_sun)."
-        )
+    t_start = time_end - time_total  # simulation start time
 
-    # Rewind perturber from impact to simulation start
+    # Always integrate the full orbit: rewind from impact to sim start, then forward.
     w_subhalo_init = agama.orbit(
         potential=pot_host,
         ic=w_subhalo_impact,
-        time=time_end - time_total - time_impact,
-        timestart=time_end + time_impact,
+        time=t_start - time_impact,   # negative -> rewind
+        timestart=time_impact,
         trajsize=1,
     )[1][0]
-
-    # Integrate forward over the full simulation window
     traj_perturber = np.column_stack(agama.orbit(
         potential=pot_host,
         ic=w_subhalo_init,
         time=time_total,
-        timestart=time_end - time_total,
+        timestart=t_start,
         trajsize=0,
     ))
 
-    return agama.Potential(
-        type='nfw',
+    eps = 1e-5  # sharp step without cubic spline ringing
+
+    if t_window is None:
+        # Default: mass on throughout the full integration
+        scale_table = np.array([
+            [t_start,  1.0, 1.0],
+            [time_end, 1.0, 1.0],
+        ])
+        if verbose:
+            print(
+                f"Perturber mass={add_perturber['mass']:.2e} M_sun "
+                f"ON for full integration (impact at t={time_impact:.3f})."
+            )
+    else:
+        # Window mode: mass on within [t_impact - t_window/2, t_impact + t_window/2],
+        # clipped to the simulation bounds [t_start, time_end].
+        # If the window edge falls outside the simulation range the corresponding
+        # transition is dropped and the mass stays on/off through that boundary.
+        t_on  = time_impact - t_window / 2.0
+        t_off = time_impact + t_window / 2.0
+
+        rows = []
+        if t_on <= t_start:
+            # Turn-on is before (or at) sim start — mass on from the beginning
+            rows.append([t_start, 1.0, 1.0])
+        else:
+            rows += [
+                [t_start,      0.0, 1.0],
+                [t_on - 2*eps, 0.0, 1.0],
+                [t_on - eps,   0.0, 1.0],  # repeated knot -> no spline ringing
+                [t_on,         1.0, 1.0],
+                [t_on + eps,   1.0, 1.0],
+            ]
+
+        if t_off >= time_end:
+            # Turn-off is at or beyond sim end — mass stays on until the end
+            rows.append([time_end, 1.0, 1.0])
+        else:
+            rows += [
+                [t_off - eps,   1.0, 1.0],
+                [t_off,         0.0, 1.0],
+                [t_off + eps,   0.0, 1.0],  # repeated knot -> no spline ringing
+                [t_off + 2*eps, 0.0, 1.0],
+                [time_end,      0.0, 1.0],
+            ]
+
+        scale_table = np.array(rows)
+
+        if verbose:
+            on_str  = f"t_start ({t_start:.3f})" if t_on  <= t_start  else f"{t_on:.3f}"
+            off_str = f"t_end ({time_end:.3f})"  if t_off >= time_end else f"{t_off:.3f}"
+            print(
+                f"Perturber mass={add_perturber['mass']:.2e} M_sun "
+                f"ON in window [{on_str}, {off_str}] "
+                f"(impact at t={time_impact:.3f})."
+            )
+
+    nfw_params = dict(
         mass=add_perturber['mass'],
         scaleRadius=add_perturber['scaleRadius'],
         center=traj_perturber,
+        scale=scale_table,
     )
+
+    if trunc_nfw:
+        return agama.Potential(type='spheroid',
+            outerCutOffRadius=15*add_perturber['scaleRadius'],
+            gamma=1, beta=3, cutoffStrength=4,
+            **nfw_params)
+
+    return agama.Potential(type='nfw', **nfw_params)
